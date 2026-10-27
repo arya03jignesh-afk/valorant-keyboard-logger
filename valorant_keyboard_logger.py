@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """VALORANT keyboard event logger for Windows.
 
-This application records low-level keyboard events while VALORANT is the active
-foreground process and writes them to a CSV file with UTC timestamps and elapsed
-milliseconds. It is designed to work independently of the Tkinter window focus
-so that the user can switch to VALORANT and play while the logger runs in the
-background.
+This app captures low-level keyboard events while VALORANT is the foreground app
+and stores them to CSV with absolute UTC timestamps and elapsed milliseconds.
 
-It uses a Windows low-level keyboard hook (WH_KEYBOARD_LL) via ctypes. The hook
-runs regardless of the Tkinter window's focus, which makes it appropriate for
-this task. A process-name check is used to determine whether VALORANT is in the
-foreground and whether keyboard events should be recorded.
+Key decisions:
+- Use Windows low-level keyboard hook (WH_KEYBOARD_LL) instead of Tkinter bind
+  because the hook continues to work when the Tkinter window does not have focus.
+- Use process image detection as the primary foreground check so the app is not
+  limited to window titles.
+- Use a queue + background writer thread so GUI updates remain responsive.
 
 Limitations:
-- Riot Vanguard or anti-cheat products may block or interfere with this kind of
-  hook.
-- This tool does not attempt to bypass anti-cheat, inject code, or manipulate the
-  game process.
-- Real-world validation requires a Windows system with VALORANT installed and
-  running, which cannot be fully tested from a non-Windows environment.
+- Riot Vanguard or other anti-cheat tools may block or interfere with the hook.
+- This app does not bypass anti-cheat or modify game memory.
+- In-game validation requires a Windows machine running VALORANT.
 """
 
 from __future__ import annotations
@@ -36,10 +32,21 @@ from typing import Any, Dict, Optional
 import tkinter as tk
 from tkinter import filedialog, ttk
 
+# ---------------------------------------------------------------------------
+# Platform-safe Windows initialization
+# ---------------------------------------------------------------------------
+try:
+    import ctypes.wintypes as wintypes
+    if ctypes.windll is not None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    else:
+        user32 = kernel32 = None
+except (AttributeError, OSError):
+    user32 = None
+    kernel32 = None
+    wintypes = None
 
-# ---------------------------------------------------------------------------
-# Windows constants and helper types
-# ---------------------------------------------------------------------------
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
@@ -48,9 +55,6 @@ WM_SYSKEYUP = 0x0105
 LLKHF_INJECTED = 0x00000010
 LLKHF_LOWER_IL_INJECTED = 0x00000002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -65,7 +69,15 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
-HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.c_wparam, ctypes.POINTER(KBDLLHOOKSTRUCT))
+if user32 is not None:
+    HOOKPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_long,
+        ctypes.c_int,
+        ctypes.c_wparam,
+        ctypes.POINTER(KBDLLHOOKSTRUCT),
+    )
+else:
+    HOOKPROC = None
 
 
 VIRTUAL_KEY_NAMES: Dict[int, str] = {
@@ -176,8 +188,8 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def timestamp_utc_from_epoch(seconds: float) -> str:
-    dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
+def timestamp_utc_from_epoch(epoch_seconds: float) -> str:
+    dt = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
     return dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
@@ -191,10 +203,18 @@ def key_name_from_vk(vk_code: int) -> str:
     return f"VK_{vk_code:02X}"
 
 
+def os_name() -> str:
+    import platform
+
+    return platform.system()
+
+
 # ---------------------------------------------------------------------------
 # Foreground process detection
 # ---------------------------------------------------------------------------
 def get_foreground_window_pid() -> Optional[int]:
+    if user32 is None:
+        return None
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
         return None
@@ -204,6 +224,8 @@ def get_foreground_window_pid() -> Optional[int]:
 
 
 def get_process_image_name(pid: int) -> str:
+    if kernel32 is None:
+        return ""
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return ""
@@ -218,24 +240,38 @@ def get_process_image_name(pid: int) -> str:
         kernel32.CloseHandle(handle)
 
 
+def get_window_title(hwnd: int) -> str:
+    if user32 is None:
+        return ""
+    buffer = (ctypes.c_wchar * 256)()
+    length = user32.GetWindowTextW(hwnd, buffer, len(buffer))
+    return buffer.value[:length]
+
+
 def is_valorant_foreground() -> bool:
     pid = get_foreground_window_pid()
     if pid is None:
         return False
+
     image_name = get_process_image_name(pid).lower()
     base_name = Path(image_name).name.lower()
-    return "valorant" in base_name or "valorant" in image_name
+    if "valorant" in base_name or "valorant" in image_name:
+        return True
+
+    hwnd = user32.GetForegroundWindow() if user32 is not None else 0
+    if hwnd:
+        title = get_window_title(hwnd).lower()
+        if "valorant" in title:
+            return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Keyboard hook management
 # ---------------------------------------------------------------------------
 class KeyboardHookManager:
-    """Low-level Windows keyboard hook manager.
-
-    The hook runs independently of the Tkinter window focus. It uses a worker
-    thread that owns a message loop required by WH_KEYBOARD_LL hooks.
-    """
+    """Low-level Windows keyboard hook manager."""
 
     def __init__(self, callback):
         self.callback = callback
@@ -246,12 +282,19 @@ class KeyboardHookManager:
         self._hook_proc = None
 
     def start(self) -> bool:
+        if user32 is None or wintypes is None:
+            raise RuntimeError("Low-level keyboard capture is only supported on Windows.")
         if self.hook_handle is not None:
             return True
 
         self.stop_event.clear()
         self._hook_proc = HOOKPROC(self._hook_callback)
-        self.hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._hook_proc, user32.GetModuleHandleW(None), 0)
+        self.hook_handle = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            self._hook_proc,
+            user32.GetModuleHandleW(None),
+            0,
+        )
         if not self.hook_handle:
             err = ctypes.WinError(ctypes.get_last_error())
             raise RuntimeError(f"Keyboard hook initialization failed: {err}")
@@ -261,8 +304,10 @@ class KeyboardHookManager:
         return True
 
     def _message_loop(self) -> None:
-        self.thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
-        msg = ctypes.wintypes.MSG()
+        if wintypes is None:
+            return
+        self.thread_id = kernel32.GetCurrentThreadId() if kernel32 is not None else None
+        msg = wintypes.MSG()
         while not self.stop_event.is_set():
             result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if result <= 0:
@@ -282,8 +327,8 @@ class KeyboardHookManager:
                 return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
             vk_code = int(lParam.contents.vkCode)
-            event_type = "key_down" if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) else "key_up"
             if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
+                event_type = "key_down" if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) else "key_up"
                 self.callback(vk_code, event_type)
 
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -321,20 +366,26 @@ class SessionRecorder:
         self.recording = False
         self.event_count = 0
         self.session_start_monotonic = 0.0
-        self.tick_base_utc = utc_now_iso()
         self._lock = threading.Lock()
 
     def start(self) -> str:
         if self.recording:
             return self.session_id
 
-        session_suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + f"_{uuid.uuid4().hex[:8]}"
-        self.session_id = f"session_{session_suffix}"
-        self.csv_path = self.output_dir / f"{self.session_id}.csv"
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        suffix = uuid.uuid4().hex[:8]
+        session_id = f"session_{timestamp}_{suffix}"
+
+        candidate = self.output_dir / f"{session_id}.csv"
+        while candidate.exists():
+            session_id = f"session_{timestamp}_{uuid.uuid4().hex[:8]}"
+            candidate = self.output_dir / f"{session_id}.csv"
+
+        self.session_id = session_id
+        self.csv_path = candidate
         self.markers_path = self.output_dir / f"{self.session_id}_markers.csv"
         self.event_count = 0
         self.session_start_monotonic = time.perf_counter()
-        self.tick_base_utc = utc_now_iso()
         self.recording = True
 
         self.writer_stop.clear()
@@ -350,11 +401,19 @@ class SessionRecorder:
 
         with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["session_id", "event_index", "timestamp_utc", "elapsed_ms", "event_type", "key_name", "virtual_key_code"])
+            writer.writerow([
+                "session_id",
+                "event_index",
+                "timestamp_utc",
+                "elapsed_ms",
+                "event_type",
+                "key_name",
+                "virtual_key_code",
+            ])
             writer.writerow([
                 self.session_id,
                 0,
-                self.tick_base_utc,
+                utc_now_iso(),
                 0.0,
                 "session_start",
                 "",
@@ -366,18 +425,17 @@ class SessionRecorder:
         if not self.recording:
             return
 
-        now_monotonic = time.perf_counter()
-        elapsed_ms = (now_monotonic - self.session_start_monotonic) * 1000.0
-        timestamp_utc = timestamp_utc_from_epoch(time.time())
+        elapsed_ms = (time.perf_counter() - self.session_start_monotonic) * 1000.0
         payload = {
             "session_id": self.session_id,
             "event_index": self.event_count + 1,
-            "timestamp_utc": timestamp_utc,
+            "timestamp_utc": utc_now_iso(),
             "elapsed_ms": round(elapsed_ms, 3),
             "event_type": event_type,
             "key_name": key_name_from_vk(vk_code),
             "virtual_key_code": vk_code,
         }
+
         self.event_queue.put(payload)
         with self._lock:
             self.event_count = max(self.event_count, payload["event_index"])
@@ -412,16 +470,15 @@ class SessionRecorder:
         if not self.recording or self.markers_path is None:
             return
 
-        elapsed_ms = (time.perf_counter() - self.session_start_monotonic) * 1000.0
         row = {
             "session_id": self.session_id,
             "timestamp_utc": utc_now_iso(),
-            "elapsed_ms": round(elapsed_ms, 3),
+            "elapsed_ms": round((time.perf_counter() - self.session_start_monotonic) * 1000.0, 3),
             "marker_label": label,
         }
-        path = self.markers_path
-        file_exists = path.exists()
-        with path.open("a", newline="", encoding="utf-8") as handle:
+
+        file_exists = self.markers_path.exists()
+        with self.markers_path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=["session_id", "timestamp_utc", "elapsed_ms", "marker_label"])
             if not file_exists:
                 writer.writeheader()
@@ -434,6 +491,7 @@ class SessionRecorder:
 
         self.recording = False
         self.writer_stop.set()
+
         if self.csv_path is not None:
             final_row = [
                 self.session_id,
@@ -477,13 +535,13 @@ class ValorantKeyboardLoggerApp:
         self.output_dir = str(Path.home() / "Documents" / "valorant_keyboard_logs")
         self.session = SessionRecorder(self.output_dir)
         self.hook = None
+
         self.status_var = tk.StringVar(value="Stopped")
         self.timer_var = tk.StringVar(value="00:00.000")
         self.counter_var = tk.StringVar(value="0")
         self.output_dir_var = tk.StringVar(value=self.output_dir)
         self.message_var = tk.StringVar(value="Ready")
         self.current_session_label_var = tk.StringVar(value="No active session")
-        self.foreground_state = False
 
         self._build_ui()
         self._update_timer()
@@ -539,11 +597,11 @@ class ValorantKeyboardLoggerApp:
         notes.pack(fill=tk.BOTH, expand=True)
 
         text = (
-            "- Start Recording begins a new session and generates a CSV file.\n"
-            "- The logger only records while VALORANT is the foreground process.\n"
-            "- When the game loses focus, the current status changes to inactive and the hook stops recording until focus returns.\n"
-            "- Current timestamps are UTC. Elapsed time is measured from the start of the active session, using a monotonic clock.\n"
-            "- If Vanguard or another anti-cheat blocks the low-level hook, the app reports the limitation instead of pretending the capture works."
+            "- Start Recording creates a new session CSV file.\n"
+            "- Events are logged only while VALORANT is the foreground process.\n"
+            "- If focus leaves VALORANT, the status becomes inactive until focus returns.\n"
+            "- UTC timestamps are absolute; elapsed_ms is from a monotonic timer for relative timing.\n"
+            "- Anti-cheat software may block the low-level hook; this app reports that limitation instead of bypassing it."
         )
         ttk.Label(notes, text=text, justify="left", wraplength=700).pack(anchor="w", padx=12, pady=12)
 
@@ -561,15 +619,11 @@ class ValorantKeyboardLoggerApp:
 
     def _poll_foreground(self) -> None:
         if self.session.recording:
-            active = is_valorant_foreground()
-            if active:
-                self.foreground_state = True
+            if is_valorant_foreground():
                 self.status_var.set("Active - VALORANT in foreground")
             else:
-                self.foreground_state = False
                 self.status_var.set("Inactive - VALORANT not in foreground")
         else:
-            self.foreground_state = False
             self.status_var.set("Stopped")
         self.root.after(250, self._poll_foreground)
 
@@ -582,6 +636,9 @@ class ValorantKeyboardLoggerApp:
             self.session.output_dir.mkdir(parents=True, exist_ok=True)
 
     def start_recording(self) -> None:
+        if self.session.recording:
+            return
+
         try:
             self.session.start()
             self.current_session_label_var.set(self.session.session_id)
@@ -589,14 +646,15 @@ class ValorantKeyboardLoggerApp:
             self.stop_btn.configure(state="normal")
             self.sync_btn.configure(state="normal")
             self.message_var.set(f"Recording to: {self.session.csv_path}")
-            self.status_var.set("Active - VALORANT in foreground")
+
             self.hook = KeyboardHookManager(self.handle_key_event)
             self.hook.start()
             self.message_var.set(f"Session started: {self.session.csv_path}")
+            self.status_var.set("Active - VALORANT in foreground")
         except Exception as exc:  # pragma: no cover - GUI error path
+            self.status_var.set("Error")
             self.message_var.set(f"Failed to start recording: {exc}")
             self.session.reset()
-            self.status_var.set("Error")
 
     def stop_recording(self) -> None:
         if self.hook is not None:
@@ -612,12 +670,14 @@ class ValorantKeyboardLoggerApp:
         except Exception as exc:  # pragma: no cover - GUI error path
             self.message_var.set(f"Error finalizing session: {exc}")
 
-        self.current_session_label_var.set(self.session.session_id)
+        last_session = self.session.session_id or "No active session"
+        self.current_session_label_var.set(last_session)
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.sync_btn.configure(state="disabled")
         self.status_var.set("Stopped")
         self.message_var.set(f"Session finished: {self.session.csv_path}")
+
         self.session.reset()
 
     def handle_key_event(self, vk_code: int, event_type: str) -> None:
@@ -648,6 +708,7 @@ class ValorantKeyboardLoggerApp:
                 self.session.stop()
         except Exception:
             pass
+
         self.root.destroy()
 
 
@@ -666,10 +727,16 @@ def main() -> None:
     root.mainloop()
 
 
-def os_name() -> str:
-    import platform
-    return platform.system()
-
-
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Notes:
+# - The app intentionally avoids Tkinter bindings because they do not capture
+#   keys when the window does not have focus.
+# - The low-level keyboard hook is the correct Windows API for this use case,
+#   but Vanguard or similar anti-cheat software may block it.
+# - This app is designed to be respectful of anti-cheat and does not attempt to
+#   manipulate the game process or inject code.
+# ---------------------------------------------------------------------------
