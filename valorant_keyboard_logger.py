@@ -535,6 +535,7 @@ class ValorantKeyboardLoggerApp:
         self.output_dir = str(Path.home() / "Documents" / "valorant_keyboard_logs")
         self.session = SessionRecorder(self.output_dir)
         self.hook = None
+        self.last_csv_path = None
 
         self.status_var = tk.StringVar(value="Stopped")
         self.timer_var = tk.StringVar(value="00:00.000")
@@ -641,22 +642,29 @@ class ValorantKeyboardLoggerApp:
 
         try:
             self.session.start()
+            self.last_csv_path = str(self.session.csv_path)
             self.current_session_label_var.set(self.session.session_id)
             self.start_btn.configure(state="disabled")
             self.stop_btn.configure(state="normal")
             self.sync_btn.configure(state="normal")
-            self.message_var.set(f"Recording to: {self.session.csv_path}")
+            self.message_var.set(f"Recording to: {self.last_csv_path}")
 
             self.hook = KeyboardHookManager(self.handle_key_event)
             self.hook.start()
-            self.message_var.set(f"Session started: {self.session.csv_path}")
+            self.message_var.set(f"Session started: {self.last_csv_path}")
             self.status_var.set("Active - VALORANT in foreground")
         except Exception as exc:  # pragma: no cover - GUI error path
             self.status_var.set("Error")
             self.message_var.set(f"Failed to start recording: {exc}")
+            self.start_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            self.sync_btn.configure(state="disabled")
+            self.current_session_label_var.set("No active session")
             self.session.reset()
 
     def stop_recording(self) -> None:
+        final_path = str(self.session.csv_path) if self.session.csv_path is not None else self.last_csv_path
+
         if self.hook is not None:
             try:
                 self.hook.stop()
@@ -676,9 +684,10 @@ class ValorantKeyboardLoggerApp:
         self.stop_btn.configure(state="disabled")
         self.sync_btn.configure(state="disabled")
         self.status_var.set("Stopped")
-        self.message_var.set(f"Session finished: {self.session.csv_path}")
+        self.message_var.set(f"Session finished: {final_path}")
 
         self.session.reset()
+        self.last_csv_path = final_path
 
     def handle_key_event(self, vk_code: int, event_type: str) -> None:
         if not self.session.recording:
